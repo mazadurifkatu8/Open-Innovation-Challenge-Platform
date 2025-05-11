@@ -11,6 +11,7 @@
 
 (define-data-var next-challenge-id uint u1)
 (define-data-var next-submission-id uint u1)
+(define-data-var challenge-ids (list 100 uint) (list))
 
 (define-map challenges
   { challenge-id: uint }
@@ -185,4 +186,91 @@
 
 (define-read-only (get-active-challenges)
   (ok true)
+)
+
+
+
+(define-constant categories (list 
+    "defi"
+    "nft" 
+    "gaming"
+    "infrastructure"
+    "social"
+))
+
+(define-map challenge-categories
+    { challenge-id: uint }
+    { category: (string-ascii 20) }
+)
+
+(define-public (set-challenge-category (challenge-id uint) (category (string-ascii 14)))
+    (let (
+        (challenge (unwrap! (map-get? challenges { challenge-id: challenge-id }) err-not-found))
+    )
+        (asserts! (is-eq tx-sender (get creator challenge)) err-unauthorized)
+        (asserts! (is-some (index-of categories category)) err-unauthorized)
+        (ok (map-set challenge-categories { challenge-id: challenge-id } { category: category }))
+    )
+)
+
+(define-private (check-category (challenge-id uint) (category (string-ascii 14)))
+    (let ((challenge-category (map-get? challenge-categories { challenge-id: challenge-id })))
+        (and 
+            (is-some challenge-category)
+            (is-eq (get category (default-to { category: "" } challenge-category)) category)
+        )
+    )
+)
+
+(define-private (check-category-helper (val uint))
+    val
+)
+
+;; (define-read-only (get-challenges-by-category (category (string-ascii 20)))
+;;     (ok (filter check-category (map check-category-helper (var-get challenge-ids))))
+;; )
+
+
+(define-map challenge-milestones 
+    { challenge-id: uint }
+    { 
+        total-milestones: uint,
+        completed-milestones: uint,
+        milestone-rewards: (list 5 uint)
+    }
+)
+
+(define-public (create-challenge-milestones (challenge-id uint) (milestone-rewards (list 5 uint)))
+    (let (
+        (challenge (unwrap! (map-get? challenges { challenge-id: challenge-id }) err-not-found))
+        (total-reward (fold + milestone-rewards u0))
+    )
+        (asserts! (is-eq tx-sender (get creator challenge)) err-unauthorized)
+        (asserts! (is-eq total-reward (get reward challenge)) err-insufficient-funds)
+        (ok (map-set challenge-milestones 
+            { challenge-id: challenge-id }
+            {
+                total-milestones: (len milestone-rewards),
+                completed-milestones: u0,
+                milestone-rewards: milestone-rewards
+            }
+        ))
+    )
+)
+
+(define-public (complete-milestone (challenge-id uint))
+    (let (
+        (challenge (unwrap! (map-get? challenges { challenge-id: challenge-id }) err-not-found))
+        (milestones (unwrap! (map-get? challenge-milestones { challenge-id: challenge-id }) err-not-found))
+        (current-milestone (get completed-milestones milestones))
+        (milestone-reward (unwrap! (element-at (get milestone-rewards milestones) current-milestone) err-not-found))
+    )
+        (asserts! (is-eq tx-sender (get creator challenge)) err-unauthorized)
+        (asserts! (< current-milestone (get total-milestones milestones)) err-unauthorized)
+        (try! (as-contract (stx-transfer? milestone-reward tx-sender (get innovator (unwrap! (map-get? submissions { submission-id: (unwrap! (get winner-id challenge) err-not-winner) }) err-not-found)))))
+        (ok (map-set challenge-milestones 
+            { challenge-id: challenge-id }
+            (merge milestones { completed-milestones: (+ current-milestone u1) })
+        ))
+    )
 )
