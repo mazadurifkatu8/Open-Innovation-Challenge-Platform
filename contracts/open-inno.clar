@@ -8,10 +8,15 @@
 (define-constant err-insufficient-funds (err u106))
 (define-constant err-unauthorized (err u107))
 (define-constant err-challenge-active (err u108))
+(define-constant err-voting-closed (err u109))
+(define-constant err-already-voted (err u110))
+(define-constant err-voting-not-started (err u111))
+(define-constant err-voting-active (err u112))
 
 (define-data-var next-challenge-id uint u1)
 (define-data-var next-submission-id uint u1)
 (define-data-var challenge-ids (list 100 uint) (list))
+(define-data-var voting-period-blocks uint u1440)
 
 (define-map challenges
   { challenge-id: uint }
@@ -46,6 +51,34 @@
 (define-map challenge-submission-list
   { challenge-id: uint }
   { submission-ids: (list 100 uint) }
+)
+
+(define-map challenge-voting
+  { challenge-id: uint }
+  {
+    voting-start-block: uint,
+    voting-end-block: uint,
+    total-votes: uint,
+    is-voting-active: bool,
+    votes-calculated: bool
+  }
+)
+
+(define-map submission-votes
+  { challenge-id: uint, submission-id: uint }
+  {
+    vote-count: uint,
+    weighted-votes: uint
+  }
+)
+
+(define-map voter-records
+  { challenge-id: uint, voter: principal }
+  {
+    voted-for: uint,
+    vote-weight: uint,
+    voted-at: uint
+  }
 )
 
 (define-public (create-challenge (title (string-ascii 100)) (description (string-utf8 500)) (reward uint))
@@ -429,6 +462,138 @@
 
 (define-read-only (get-challenge-requirements (challenge-id uint))
   (map-get? challenge-reputation-requirements { challenge-id: challenge-id })
+)
+
+(define-public (start-voting (challenge-id uint))
+  (let
+    ((challenge (unwrap! (map-get? challenges { challenge-id: challenge-id }) err-not-found))
+     (voting-start (+ stacks-block-height u1))
+     (voting-end (+ voting-start (var-get voting-period-blocks))))
+    
+    (asserts! (is-eq tx-sender (get creator challenge)) err-unauthorized)
+    (asserts! (not (get is-active challenge)) err-challenge-active)
+    (asserts! (is-none (get winner-id challenge)) err-not-found)
+    
+    (map-set challenge-voting
+      { challenge-id: challenge-id }
+      {
+        voting-start-block: voting-start,
+        voting-end-block: voting-end,
+        total-votes: u0,
+        is-voting-active: true,
+        votes-calculated: false
+      }
+    )
+    (ok voting-end)
+  )
+)
+
+(define-public (cast-vote (challenge-id uint) (submission-id uint))
+  (let
+    ((challenge (unwrap! (map-get? challenges { challenge-id: challenge-id }) err-not-found))
+     (submission (unwrap! (map-get? submissions { submission-id: submission-id }) err-not-found))
+     (voting-info (unwrap! (map-get? challenge-voting { challenge-id: challenge-id }) err-voting-not-started))
+     (voter-rep (map-get? innovator-reputation { innovator: tx-sender }))
+     (existing-vote (map-get? voter-records { challenge-id: challenge-id, voter: tx-sender }))
+     (vote-weight (+ u1 (get reputation-score (default-to 
+                                              { total-submissions: u0, total-wins: u0, total-rewards-earned: u0, reputation-score: u0, last-updated: u0 }
+                                              voter-rep))))
+     (current-votes (default-to { vote-count: u0, weighted-votes: u0 } 
+                                 (map-get? submission-votes { challenge-id: challenge-id, submission-id: submission-id }))))
+    
+    (asserts! (is-eq challenge-id (get challenge-id submission)) err-not-found)
+    (asserts! (get is-voting-active voting-info) err-voting-closed)
+    (asserts! (>= stacks-block-height (get voting-start-block voting-info)) err-voting-not-started)
+    (asserts! (< stacks-block-height (get voting-end-block voting-info)) err-voting-closed)
+    (asserts! (is-none existing-vote) err-already-voted)
+    
+    (map-set voter-records
+      { challenge-id: challenge-id, voter: tx-sender }
+      {
+        voted-for: submission-id,
+        vote-weight: vote-weight,
+        voted-at: stacks-block-height
+      }
+    )
+    
+    (map-set submission-votes
+      { challenge-id: challenge-id, submission-id: submission-id }
+      {
+        vote-count: (+ (get vote-count current-votes) u1),
+        weighted-votes: (+ (get weighted-votes current-votes) vote-weight)
+      }
+    )
+    
+    (map-set challenge-voting
+      { challenge-id: challenge-id }
+      (merge voting-info { total-votes: (+ (get total-votes voting-info) u1) })
+    )
+    
+    (ok vote-weight)
+  )
+)
+
+(define-public (finalize-voting (challenge-id uint))
+  (let
+    ((challenge (unwrap! (map-get? challenges { challenge-id: challenge-id }) err-not-found))
+     (voting-info (unwrap! (map-get? challenge-voting { challenge-id: challenge-id }) err-voting-not-started))
+     (submission-list (unwrap! (map-get? challenge-submission-list { challenge-id: challenge-id }) err-not-found)))
+    
+    (asserts! (is-eq tx-sender (get creator challenge)) err-unauthorized)
+    (asserts! (get is-voting-active voting-info) err-voting-closed)
+    (asserts! (>= stacks-block-height (get voting-end-block voting-info)) err-voting-active)
+    (asserts! (not (get votes-calculated voting-info)) err-unauthorized)
+    
+    (let
+      ((winning-submission (fold determine-winner (get submission-ids submission-list) { winner-id: u0, max-votes: u0 })))
+      
+      (map-set challenges
+        { challenge-id: challenge-id }
+        (merge challenge { winner-id: (some (get winner-id winning-submission)) })
+      )
+      
+      (map-set challenge-voting
+        { challenge-id: challenge-id }
+        (merge voting-info { is-voting-active: false, votes-calculated: true })
+      )
+      
+      (ok (get winner-id winning-submission))
+    )
+  )
+)
+
+(define-private (determine-winner (submission-id uint) (current-winner { winner-id: uint, max-votes: uint }))
+  (let
+    ((submission-vote-data (default-to { vote-count: u0, weighted-votes: u0 } 
+                                        (map-get? submission-votes { challenge-id: u0, submission-id: submission-id }))))
+    
+    (if (> (get weighted-votes submission-vote-data) (get max-votes current-winner))
+      { winner-id: submission-id, max-votes: (get weighted-votes submission-vote-data) }
+      current-winner)
+  )
+)
+
+(define-read-only (get-voting-info (challenge-id uint))
+  (map-get? challenge-voting { challenge-id: challenge-id })
+)
+
+(define-read-only (get-submission-votes (challenge-id uint) (submission-id uint))
+  (map-get? submission-votes { challenge-id: challenge-id, submission-id: submission-id })
+)
+
+(define-read-only (get-voter-record (challenge-id uint) (voter principal))
+  (map-get? voter-records { challenge-id: challenge-id, voter: voter })
+)
+
+(define-read-only (is-voting-active (challenge-id uint))
+  (let
+    ((voting-info (map-get? challenge-voting { challenge-id: challenge-id })))
+    (match voting-info
+      info (and (get is-voting-active info)
+                (>= stacks-block-height (get voting-start-block info))
+                (< stacks-block-height (get voting-end-block info)))
+      false)
+  )
 )
 
 (define-public (initialize-system)
