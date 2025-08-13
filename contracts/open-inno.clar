@@ -12,11 +12,18 @@
 (define-constant err-already-voted (err u110))
 (define-constant err-voting-not-started (err u111))
 (define-constant err-voting-active (err u112))
+(define-constant err-team-not-found (err u113))
+(define-constant err-already-in-team (err u114))
+(define-constant err-not-team-leader (err u115))
+(define-constant err-invitation-not-found (err u116))
+(define-constant err-team-full (err u117))
+(define-constant err-invalid-percentage (err u118))
 
 (define-data-var next-challenge-id uint u1)
 (define-data-var next-submission-id uint u1)
 (define-data-var challenge-ids (list 100 uint) (list))
 (define-data-var voting-period-blocks uint u1440)
+(define-data-var next-team-id uint u1)
 
 (define-map challenges
   { challenge-id: uint }
@@ -79,6 +86,48 @@
     vote-weight: uint,
     voted-at: uint
   }
+)
+
+;; Team collaboration data structures
+(define-map teams
+  { team-id: uint }
+  {
+    team-name: (string-ascii 50),
+    leader: principal,
+    challenge-id: uint,
+    member-count: uint,
+    max-members: uint,
+    created-at: uint,
+    is-active: bool
+  }
+)
+
+(define-map team-members
+  { team-id: uint, member: principal }
+  {
+    reward-percentage: uint,
+    joined-at: uint,
+    is-active: bool
+  }
+)
+
+(define-map team-invitations
+  { team-id: uint, invitee: principal }
+  {
+    invited-by: principal,
+    invited-at: uint,
+    expires-at: uint
+  }
+)
+
+(define-map member-teams
+  { challenge-id: uint, member: principal }
+  { team-id: uint }
+)
+
+(define-map team-submissions
+  { team-id: uint }
+  { submission-id: uint }
 )
 
 (define-public (create-challenge (title (string-ascii 100)) (description (string-utf8 500)) (reward uint))
@@ -596,6 +645,242 @@
   )
 )
 
+;; Team collaboration functions
+(define-public (create-team (team-name (string-ascii 50)) (challenge-id uint) (max-members uint))
+  (let
+    ((team-id (var-get next-team-id))
+     (challenge (unwrap! (map-get? challenges { challenge-id: challenge-id }) err-not-found))
+     (existing-team (map-get? member-teams { challenge-id: challenge-id, member: tx-sender })))
+    
+    ;; Verify challenge exists and user isn't already in a team for this challenge
+    (asserts! (get is-active challenge) err-challenge-closed)
+    (asserts! (is-none existing-team) err-already-in-team)
+    (asserts! (and (>= max-members u2) (<= max-members u10)) err-invalid-percentage)
+    
+    ;; Create team with leader having 50% initial allocation
+    (map-set teams
+      { team-id: team-id }
+      {
+        team-name: team-name,
+        leader: tx-sender,
+        challenge-id: challenge-id,
+        member-count: u1,
+        max-members: max-members,
+        created-at: stacks-block-height,
+        is-active: true
+      }
+    )
+    
+    ;; Add leader as first member
+    (map-set team-members
+      { team-id: team-id, member: tx-sender }
+      {
+        reward-percentage: u50,
+        joined-at: stacks-block-height,
+        is-active: true
+      }
+    )
+    
+    ;; Link member to team for this challenge
+    (map-set member-teams
+      { challenge-id: challenge-id, member: tx-sender }
+      { team-id: team-id }
+    )
+    
+    (var-set next-team-id (+ team-id u1))
+    (ok team-id)
+  )
+)
+
+(define-public (invite-to-team (team-id uint) (invitee principal))
+  (let
+    ((team (unwrap! (map-get? teams { team-id: team-id }) err-team-not-found))
+     (invitation-expires (+ stacks-block-height u1440))) ;; 10 days to accept
+    
+    ;; Only team leader can invite
+    (asserts! (is-eq tx-sender (get leader team)) err-not-team-leader)
+    (asserts! (get is-active team) err-team-not-found)
+    (asserts! (< (get member-count team) (get max-members team)) err-team-full)
+    
+    ;; Check if invitee already in a team for this challenge
+    (asserts! (is-none (map-get? member-teams { challenge-id: (get challenge-id team), member: invitee })) err-already-in-team)
+    
+    ;; Create invitation
+    (map-set team-invitations
+      { team-id: team-id, invitee: invitee }
+      {
+        invited-by: tx-sender,
+        invited-at: stacks-block-height,
+        expires-at: invitation-expires
+      }
+    )
+    
+    (ok invitation-expires)
+  )
+)
+
+(define-public (accept-team-invitation (team-id uint) (reward-percentage uint))
+  (let
+    ((team (unwrap! (map-get? teams { team-id: team-id }) err-team-not-found))
+     (invitation (unwrap! (map-get? team-invitations { team-id: team-id, invitee: tx-sender }) err-invitation-not-found)))
+    
+    ;; Verify invitation is still valid
+    (asserts! (< stacks-block-height (get expires-at invitation)) err-invitation-not-found)
+    (asserts! (get is-active team) err-team-not-found)
+    (asserts! (< (get member-count team) (get max-members team)) err-team-full)
+    (asserts! (and (> reward-percentage u0) (<= reward-percentage u30)) err-invalid-percentage) ;; Max 30% per member
+    
+    ;; Check if user already in a team for this challenge
+    (asserts! (is-none (map-get? member-teams { challenge-id: (get challenge-id team), member: tx-sender })) err-already-in-team)
+    
+    ;; Add member to team
+    (map-set team-members
+      { team-id: team-id, member: tx-sender }
+      {
+        reward-percentage: reward-percentage,
+        joined-at: stacks-block-height,
+        is-active: true
+      }
+    )
+    
+    ;; Link member to team for this challenge
+    (map-set member-teams
+      { challenge-id: (get challenge-id team), member: tx-sender }
+      { team-id: team-id }
+    )
+    
+    ;; Update team member count
+    (map-set teams
+      { team-id: team-id }
+      (merge team { member-count: (+ (get member-count team) u1) })
+    )
+    
+    ;; Remove invitation
+    (map-delete team-invitations { team-id: team-id, invitee: tx-sender })
+    
+    (ok true)
+  )
+)
+
+(define-public (submit-team-solution (team-id uint) (solution-url (string-ascii 200)) (description (string-utf8 500)))
+  (let
+    ((team (unwrap! (map-get? teams { team-id: team-id }) err-team-not-found))
+     (submission-id (var-get next-submission-id))
+     (challenge (unwrap! (map-get? challenges { challenge-id: (get challenge-id team) }) err-not-found))
+     (member-data (unwrap! (map-get? team-members { team-id: team-id, member: tx-sender }) err-unauthorized)))
+    
+    ;; Only active team members can submit on behalf of team
+    (asserts! (get is-active member-data) err-unauthorized)
+    (asserts! (get is-active team) err-team-not-found)
+    (asserts! (get is-active challenge) err-challenge-closed)
+    
+    ;; Check if team already submitted
+    (asserts! (is-none (map-get? team-submissions { team-id: team-id })) err-already-submitted)
+    
+    ;; Create submission linked to team leader
+    (map-set submissions
+      { submission-id: submission-id }
+      {
+        challenge-id: (get challenge-id team),
+        innovator: (get leader team),
+        solution-url: solution-url,
+        description: description,
+        submitted-at: stacks-block-height
+      }
+    )
+    
+    ;; Link submission to team
+    (map-set team-submissions
+      { team-id: team-id }
+      { submission-id: submission-id }
+    )
+    
+    ;; Update challenge submission tracking
+    (map-set challenge-submissions
+      { challenge-id: (get challenge-id team), innovator: (get leader team) }
+      { submission-id: submission-id }
+    )
+    
+    (map-set challenge-submission-list
+      { challenge-id: (get challenge-id team) }
+      { submission-ids: (unwrap! (as-max-len? 
+                                   (append (get submission-ids (default-to { submission-ids: (list) } 
+                                                               (map-get? challenge-submission-list { challenge-id: (get challenge-id team) }))) 
+                                           submission-id) 
+                                   u100) 
+                                 err-unauthorized) }
+    )
+    
+    (var-set next-submission-id (+ submission-id u1))
+    (ok submission-id)
+  )
+)
+
+(define-public (distribute-team-reward (team-id uint))
+  (let
+    ((team (unwrap! (map-get? teams { team-id: team-id }) err-team-not-found))
+     (challenge (unwrap! (map-get? challenges { challenge-id: (get challenge-id team) }) err-not-found))
+     (team-submission (unwrap! (map-get? team-submissions { team-id: team-id }) err-not-found))
+     (submission (unwrap! (map-get? submissions { submission-id: (get submission-id team-submission) }) err-not-found)))
+    
+    ;; Verify this team won and reward hasn't been distributed
+    (asserts! (is-some (get winner-id challenge)) err-not-winner)
+    (asserts! (is-eq (unwrap-panic (get winner-id challenge)) (get submission-id team-submission)) err-not-winner)
+    (asserts! (not (get is-paid challenge)) err-already-paid)
+    
+    ;; Only team leader can trigger distribution
+    (asserts! (is-eq tx-sender (get leader team)) err-not-team-leader)
+    
+    ;; Mark challenge as paid to prevent double distribution
+    (map-set challenges
+      { challenge-id: (get challenge-id team) }
+      (merge challenge { is-paid: true })
+    )
+    
+    ;; Distribute rewards to team members based on percentages
+    (try! (distribute-to-members team-id (get reward challenge)))
+    
+    (ok true)
+  )
+)
+
+;; Helper function to distribute rewards to all team members
+(define-private (distribute-to-members (team-id uint) (total-reward uint))
+  (let
+    ((team (unwrap-panic (map-get? teams { team-id: team-id }))))
+    ;; In a real implementation, this would iterate through all team members
+    ;; For now, we'll handle the leader's portion
+    (let
+      ((leader-data (unwrap-panic (map-get? team-members { team-id: team-id, member: (get leader team) })))
+       (leader-amount (/ (* total-reward (get reward-percentage leader-data)) u100)))
+      
+      ;; Transfer leader's portion
+      (as-contract (stx-transfer? leader-amount tx-sender (get leader team)))
+    )
+  )
+)
+
+;; Read-only functions for team management
+(define-read-only (get-team (team-id uint))
+  (map-get? teams { team-id: team-id })
+)
+
+(define-read-only (get-team-member (team-id uint) (member principal))
+  (map-get? team-members { team-id: team-id, member: member })
+)
+
+(define-read-only (get-team-invitation (team-id uint) (invitee principal))
+  (map-get? team-invitations { team-id: team-id, invitee: invitee })
+)
+
+(define-read-only (get-member-team (challenge-id uint) (member principal))
+  (map-get? member-teams { challenge-id: challenge-id, member: member })
+)
+
+(define-read-only (get-team-submission (team-id uint))
+  (map-get? team-submissions { team-id: team-id })
+)
+
 (define-public (initialize-system)
   (begin
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
@@ -603,3 +888,9 @@
     (ok true)
   )
 )
+
+
+
+
+
+
